@@ -1,0 +1,5 @@
+{
+  "name": "secure-cli-rag (devcontainer)",
+  "image": "mcr.microsoft.com/vscode/devcontainers/python:3.11",
+  "workspaceFolder": "/workspace"
+}

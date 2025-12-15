@@ -1,0 +1,10 @@
+typer
+rich
+langchain
+faiss-cpu
+pandas
+openpyxl
+python-docx
+PyMuPDF
+sentence-transformers
+pytest
