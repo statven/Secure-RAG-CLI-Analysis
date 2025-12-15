@@ -74,15 +74,68 @@ High-level components:
 * **RAG Engine** - compose prompt, call LLM, format answers + citations, hallucination checks.
 * **Security Layer** - RBAC policies, redaction rules, audit logging.
 
-Diagram (concept):
+Diagram :
 
 ```
-CLI -> Ingestion -> Chunking/Tagging -> Embeddings -> FAISS
-             ^                                      |
-             |                                      v
-           Files                               Retrieval -> RAG Engine -> CLI
-                                                 |
-                                            Security Filter
+┌──────────────────────────────────────────┐
+│              User (CLI)                  │
+│  python rag.py query --file X --role Y   │
+└───────────────────┬──────────────────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────────┐
+│            CLI Layer (Typer)              │
+│  - Argument parsing                       │
+│  - Role validation                       │
+│  - Interactive / single-shot mode        │
+└───────────────────┬──────────────────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────────┐
+│          Ingestion Layer                  │
+│  - File type detection                   │
+│  - PDF / DOCX / TXT parsing              │
+│  - CSV / XLSX parsing                    │
+│  - Text normalization                    │
+│  - Chunking                              │
+│  - Sensitivity tagging                   │
+└───────────────────┬──────────────────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────────┐
+│        Embedding & Vector Store           │
+│  - HuggingFace Embeddings                │
+│  - FAISS / Chroma                        │
+│  - Metadata storage (page, row, role)    │
+└───────────────────┬──────────────────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────────┐
+│          Retrieval Layer                  │
+│  - Similarity search                     │
+│  - Metadata filtering                    │
+│  - RBAC enforcement                      │
+└───────────────────┬──────────────────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────────┐
+│            RAG Engine                     │
+│  - Prompt construction                   │
+│  - LLM call                              │
+│  - Answer grounding                      │
+│  - Citation enforcement                 │
+│  - Hallucination checks                  │
+└───────────────────┬──────────────────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────────┐
+│          Output Formatter                 │
+│  - Answer text                           │
+│  - Access Denied / Redaction             │
+│  - Exact citations                       │
+│  - Rich terminal output                  │
+└──────────────────────────────────────────┘
+
 ```
 
 ---
