@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 **Secure Context-Aware CLI RAG for Document Analysis**
 A command-line tool that uses Retrieval-Augmented Generation (RAG) to analyze user-provided documents (PDF, DOCX, TXT, CSV, XLSX) with strict Role-Based Access Control (RBAC), precise citations, and provable, evidence-backed answers.
 
@@ -379,3 +380,6 @@ Citations:
 Access Denied: The requested information is restricted for role 'low_rank'.
 ```
 
+=======
+# Secure-RAG-CLI-Analysis
+>>>>>>> a7e37dcb7fded96120e60873b4ca1cb7e588a8c8
