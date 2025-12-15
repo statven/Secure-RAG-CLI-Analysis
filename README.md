@@ -1,5 +1,4 @@
-<<<<<<< HEAD
-**Secure Context-Aware CLI RAG for Document Analysis**
+##Secure Context-Aware CLI RAG for Document Analysis
 A command-line tool that uses Retrieval-Augmented Generation (RAG) to analyze user-provided documents (PDF, DOCX, TXT, CSV, XLSX) with strict Role-Based Access Control (RBAC), precise citations, and provable, evidence-backed answers.
 
 ---
@@ -39,7 +38,7 @@ A command-line tool that uses Retrieval-Augmented Generation (RAG) to analyze us
 12. [Development Guidelines](#development-guidelines)
 13. [Deliverables](#deliverables)
 14. [Contributing & Code of Conduct](#contributing--code-of-conduct)
-15. [License & Contact](#license--contact)
+
 
 ---
 
@@ -65,13 +64,13 @@ This project aims to provide a trustworthy, auditable CLI for querying documents
 
 High-level components:
 
-* **CLI (Typer)** — user interface, handles args, role, and I/O formatting (Rich).
-* **Ingestion** — file type detection, parsing, normalization, chunking, and sensitivity tagging.
-* **Embeddings** — converts chunks to dense vectors via pluggable provider (HF models).
-* **Vector Store** — FAISS wrapper storing vectors + metadata (doc_id, page, chunk_id, sensitivity...).
-* **Retrieval** — similarity search + metadata filters (role enforcement applied pre-or post-retrieval).
-* **RAG Engine** — compose prompt, call LLM, format answers + citations, hallucination checks.
-* **Security Layer** — RBAC policies, redaction rules, audit logging.
+* **CLI (Typer)** - user interface, handles args, role, and I/O formatting (Rich).
+* **Ingestion** - file type detection, parsing, normalization, chunking, and sensitivity tagging.
+* **Embeddings** - converts chunks to dense vectors via pluggable provider (HF models).
+* **Vector Store** - FAISS wrapper storing vectors + metadata (doc_id, page, chunk_id, sensitivity...).
+* **Retrieval** - similarity search + metadata filters (role enforcement applied pre-or post-retrieval).
+* **RAG Engine** - compose prompt, call LLM, format answers + citations, hallucination checks.
+* **Security Layer** - RBAC policies, redaction rules, audit logging.
 
 Diagram (concept):
 
@@ -136,7 +135,7 @@ Expected outputs:
 * If answer found and role allows access:
 
   ```
-  Answer: The timeline is 6 weeks. (See: example.pdf — Page 2, Chunk 3)
+  Answer: The timeline is 6 weeks. (See: example.pdf - Page 2, Chunk 3)
   ```
 * If found but restricted:
 
@@ -203,7 +202,7 @@ Each chunk stored in the vector store SHOULD include:
 }
 ```
 
-This schema enables deterministic citations: `See: {doc_id} — Page {page}, Chunk {chunk_id}` or `See: {doc_id} — Row {row}, Column '{column}'`.
+This schema enables deterministic citations: `See: {doc_id} - Page {page}, Chunk {chunk_id}` or `See: {doc_id} - Row {row}, Column '{column}'`.
 
 ## Sensitivity Tagging
 
@@ -229,16 +228,16 @@ If the user's role prevents access to supporting chunks, reply: "Access Denied."
 Format:
 Answer: <concise answer>
 Citations:
-- <doc_id> — Page <p>, Chunk <id>
-- <doc_id2> — Row <r>, Column '<col>'
+- <doc_id> - Page <p>, Chunk <id>
+- <doc_id2> - Row <r>, Column '<col>'
 ```
 
 **User prompt**: the question + retrieved chunks appended below.
 
 ## Citation Format
 
-* For pages: `See: {doc_id} — Page {page}, Chunk {chunk_id}`
-* For tabular: `See: {doc_id} — Row {row}, Column '{column}'`
+* For pages: `See: {doc_id} - Page {page}, Chunk {chunk_id}`
+* For tabular: `See: {doc_id} - Row {row}, Column '{column}'`
 * The system should print both the answer and a bullet list of citations.
 
 ## Hallucination Guardrails
@@ -255,9 +254,9 @@ Citations:
 
 ## Role Examples
 
-* `low_rank` — minimal access; no `internal`/`secret` info.
-* `high_rank` — broader access; can see `internal` but not `secret`.
-* `admin` — full access.
+* `low_rank` - minimal access; no `internal`/`secret` info.
+* `high_rank` - broader access; can see `internal` but not `secret`.
+* `admin` - full access.
 
 ## Policy Example (YAML)
 
@@ -324,8 +323,8 @@ Create test fixtures in `/data` (multi-column PDF, long DOCX, tabular CSV/XLSX) 
 
 ## Recommended Branching
 
-* `main` — release branch (protected).
-* `develop` — integration branch.
+* `main` - release branch (protected).
+* `develop` - integration branch.
 * `feature/*`, `hotfix/*` per task.
 * PRs require 1 reviewer + CI pass.
 
@@ -353,33 +352,3 @@ Create test fixtures in `/data` (multi-column PDF, long DOCX, tabular CSV/XLSX) 
 * Use Conventional Commits: `feat:`, `fix:`, `chore:`, etc. Include issue reference when applicable.
 
 ---
-
-# License & Contact
-
-This repository is provided under the **MIT License** (or choose your preferred license). See `LICENSE` for details.
-
-For questions or support, open an issue or reach out to the maintainers listed in `AUTHORS.md`.
-
----
-
-## Appendix — Quick Examples
-
-### Citation example (expected CLI output)
-
-```
-Answer:
-The contract term is 12 months.
-
-Citations:
-- example_contract.docx — Page 4, Chunk example_contract.docx::p4::c1
-```
-
-### RBAC example (expected CLI output for restricted content)
-
-```
-Access Denied: The requested information is restricted for role 'low_rank'.
-```
-
-=======
-# Secure-RAG-CLI-Analysis
->>>>>>> a7e37dcb7fded96120e60873b4ca1cb7e588a8c8
