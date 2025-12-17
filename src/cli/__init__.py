@@ -1,1 +1,0 @@
-"""CLI package for secure-cli-rag"""
