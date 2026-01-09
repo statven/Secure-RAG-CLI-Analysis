@@ -1,4 +1,3 @@
-# src/cli.py
 import typer
 from pathlib import Path
 from rich import print
@@ -26,8 +25,7 @@ def ingest(
         print(f"[red]File not found: {file}[/red]")
         raise typer.Exit(code=1)
         
-    doc_id = doc_id or file.stem # Используем имя файла без расширения как ID
-    
+    doc_id = doc_id or file.stem 
     try:
         ingest_file(str(file), doc_id=doc_id, sensitivity=sensitivity)
         
@@ -40,17 +38,19 @@ def ingest(
         raise typer.Exit(code=1)
 
 @app.command()
-def query(file: Path = typer.Option(None, help="(optional) file to auto-ingest before query"),
-          doc_id: str = typer.Option(None, help="document id to query"),
-          role: str = typer.Option(..., help="role: low_rank | high_rank"),
-          q: str = typer.Argument(..., help="Question to ask")):
+def query(
+    file: Path = typer.Option(None, help="(optional) file to auto-ingest before query"),
+    doc_id: str = typer.Option(None, help="document id to query"),
+    role: str = typer.Option(..., help="role: low_rank | high_rank"),
+    q: str = typer.Argument(..., help="Question to ask")
+):
     """Query a document via RAG (strictly grounded answers)"""
-    # if file provided, ingest
     if file:
-        ingest_file(str(file), doc_id=(doc_id or file.name))
+        ingest_file(str(file), doc_id=(doc_id or file.stem), sensitivity="low")
+    
     engine = RagEngine(role=role)
-    answer = engine.answer(question=q, doc_id=doc_id)
-    print(answer)
+    
+    engine.answer(question=q, doc_id=doc_id)
 
 if __name__ == "__main__":
     app()

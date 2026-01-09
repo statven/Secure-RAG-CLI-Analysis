@@ -1,49 +1,48 @@
-# src/vectorstore.py
 import os
+import shutil
 from typing import List, Dict, Any
-from langchain_huggingface import HuggingFaceEmbeddings # Updated import standard
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+
+
+from langchain_classic.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 
-# Используем модель, указанную в ТЗ (быстрая и эффективная)
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 class VectorStoreClient:
     def __init__(self, index_dir: str = "data/faiss_index"):
         self.index_dir = index_dir
-        # Используем HuggingFaceEmbeddings (CPU optimized)
         self.emb = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
         self.vs = self._load_index()
 
     def _load_index(self):
-        """Загружает индекс FAISS используя нативный метод load_local."""
         if os.path.exists(os.path.join(self.index_dir, "index.faiss")):
-            # allow_dangerous_deserialization нужен для локальных доверенных файлов
             return FAISS.load_local(self.index_dir, self.emb, allow_dangerous_deserialization=True)
-        else:
-            return None
+        return None
 
     def _save_index(self):
-        """Сохраняет индекс используя нативный метод save_local."""
         if self.vs:
             self.vs.save_local(self.index_dir)
 
-
-    def add_documents(self, doc_id: str, chunks: List[Dict[str, Any]]):
+    def upsert_document(self, doc_id: str, chunks: List[Dict[str, Any]]):
         texts = [c["text"] for c in chunks]
         metadatas = [c["metadata"] for c in chunks]
         
-        # 1. Если индекс уже существует, пытаемся удалить старые записи этого doc_id
+        # 1. If the index exists, delete old chunks
         if self.vs is not None:
-            try:
-                # В новых версиях LangChain FAISS поддерживает delete по фильтру
-                self.vs.delete(filter={"doc_id": doc_id})
-            except Exception:
-                # Если delete не поддерживается напрямую, в локальных проектах 
-                # проще очистить и пересобрать индекс для чистоты
-                pass
 
-        # 2. Добавление новых документов
+            ids_to_delete = []
+            for uid, doc in self.vs.docstore._dict.items():
+                if doc.metadata.get("doc_id") == doc_id:
+                    ids_to_delete.append(uid)
+            
+            if ids_to_delete:
+                self.vs.delete(ids_to_delete)
+                print(f"Upsert: Deleted {len(ids_to_delete)} old chunks for '{doc_id}'")
+
+        # 2. Adding new
         if self.vs is None:
             self.vs = FAISS.from_texts(texts, self.emb, metadatas=metadatas)
         else:
@@ -51,13 +50,24 @@ class VectorStoreClient:
         
         self._save_index()
 
-    def query(self, q: str, k: int = 10, metadata_filter: dict = None):
+    def get_hybrid_retriever(self, k: int = 30):
         if self.vs is None:
-            return []
-        
-        # КЛЮЧЕВОЕ: Если фильтр пустой (для роли high_rank), не передаем его, 
-        # чтобы FAISS искал по всей базе
-        if not metadata_filter:
-            return self.vs.similarity_search(q, k=k)
+            return None
             
-        return self.vs.similarity_search(q, k=k, filter=metadata_filter)
+        # 1. Semantic Retriever (FAISS)
+        faiss_retriever = self.vs.as_retriever(search_kwargs={"k": k})
+        
+        # 2. Keyword Retriever (BM25)
+        all_docs = list(self.vs.docstore._dict.values())
+        if not all_docs:
+            return faiss_retriever # Fallback if empty
+            
+        bm25_retriever = BM25Retriever.from_documents(all_docs)
+        bm25_retriever.k = k
+        
+        # 3. Ensemble (Weights: 0.5 semantic, 0.5 keyword)
+        ensemble_retriever = EnsembleRetriever(
+            retrievers=[bm25_retriever, faiss_retriever],
+            weights=[0.3, 0.7]
+        )
+        return ensemble_retriever
