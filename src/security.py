@@ -1,24 +1,32 @@
-# src/security.py
-import re
 from typing import Dict, Any
 
-SENSITIVE_KEYWORDS = [
-    "salary", "confidential", "trade secret", "secret", "ssn", "social security",
-    "privileged", "classified", "internal use only"
-]
 
-def detect_sensitivity_for_chunk(text: str, metadata: Dict[str, Any]) -> str:
-    t = text.lower()
-    for kw in SENSITIVE_KEYWORDS:
-        if kw in t:
-            return "high"
-    return "low"
+LEVEL_LOW = "low"
+LEVEL_HIGH = "high"
+VALID_LEVELS = [LEVEL_LOW, LEVEL_HIGH]
 
-def role_allows(role: str, sensitivity: str) -> bool:
+def validate_sensitivity(level: str) -> str:
+    """Checks that the entered level is correct."""
+    level = level.lower().strip()
+    if level not in VALID_LEVELS:
+        raise ValueError(f"Invalid sensitivity level: '{level}'. Allowed: {VALID_LEVELS}")
+    return level
+
+def role_allows(user_role: str, chunk_sensitivity: str) -> bool:
     """
-    Simple RBAC: low_rank cannot see 'high' sensitive chunks
+    RBAC Logic:
+    - Admin/High_rank sees everything
+    - Low_rank only sees 'low'.
     """
-    role = role.lower()
-    if sensitivity == "high" and role != "high_rank" and role != "admin":
-        return False
-    return True
+    user_role = user_role.lower()
+    chunk_sensitivity = chunk_sensitivity.lower()
+
+    # public chunck
+    if chunk_sensitivity == LEVEL_LOW:
+        return True
+    
+    # secret
+    if chunk_sensitivity == LEVEL_HIGH:
+        return user_role in ["high_rank", "admin"]
+    
+    return False
