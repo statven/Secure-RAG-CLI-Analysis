@@ -1,8 +1,13 @@
 import os
 import time
-import re
-from typing import Optional, List, Dict, Tuple
+import json
+import numpy as np
+from pathlib import Path
+from collections import deque
+from typing import Optional, List, Dict
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.messages import HumanMessage, SystemMessage
+from sentence_transformers import util
 
 from src.vectorstore import VectorStoreClient
 from src.security import role_allows
@@ -19,7 +24,20 @@ class RagEngine:
         self.vs = VectorStoreClient()
         self.console = Console()
         
-        main_model_name = "gemini-2.5-flash" if model_type == "pro" else "gemini-2.5-flash"
+        # --- DH-RAG v2 Components ---
+        
+        # 1. Active Context (Structured State)
+        # Instead of just a text log, we treat summary as the "Active Working Memory".
+        self.active_context = "" 
+        
+        # 2. Last Intent (The "Predicate")
+        # Explicitly tracking what the user is looking for (e.g., "counting friends", "dates").
+        self.current_intent = "General inquiry"
+        
+        self.history_file = Path("data/chat_session.json")
+        self._load_session() 
+        
+        main_model_name = "gemini-2.5-flash-lite"
         
         if not os.getenv("GOOGLE_API_KEY"):
             raise ValueError("GOOGLE_API_KEY env var missing")
@@ -28,249 +46,171 @@ class RagEngine:
             model=main_model_name,
             temperature=0,
         )
-        
-        # LLM-as-a-Judge
-        self.judge_llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash-lite", 
-            temperature=0
+
+    def _load_session(self):
+        """Loads the active context state."""
+        if self.history_file.exists():
+            try:
+                data = json.loads(self.history_file.read_text(encoding="utf-8"))
+                self.active_context = data.get("summary", "")
+                self.current_intent = data.get("intent", "General inquiry")
+            except: pass
+
+    def _save_session(self):
+        """Persists state."""
+        self.history_file.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "summary": self.active_context,
+            "intent": self.current_intent
+        }
+        self.history_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    def _rewrite_query(self, raw_query: str) -> str:
+        """
+        CRITICAL FIX FOR INTENT DRIFT.
+        Converts ambiguous follow-ups ("And him?") into standalone queries ("Does Voldemort have friends?").
+        Uses the Active Context to resolve references and carry over the predicate.
+        """
+        if not self.active_context:
+            return raw_query
+
+        # Prompt explicitly asks to merge context + query into a Standalone Question
+        prompt = (
+            "You are a Query Reformulator. Your goal is to make the user's question STANDALONE.\n"
+            "Use the Context to fill in missing entities or intents (what is being asked).\n"
+            "If the user asks 'And him?', apply the previous question's intent to the new entity.\n\n"
+            f"Active Context: {self.active_context}\n"
+            f"Last Intent: {self.current_intent}\n"
+            f"Raw User Input: {raw_query}\n\n"
+            "Standalone Question:"
         )
+        
+        try:
+            # We use a fast call here.
+            rewritten = self.llm.invoke(prompt).content.strip()
+            # Visual debug for the user to see the "Thinking" process
+            self.console.print(f"[dim]🔎 Logic: '{raw_query}' -> '{rewritten}'[/dim]")
+            return rewritten
+        except:
+            return raw_query
+
+    def _update_state(self, last_q: str, last_a: str, rewritten_q: str):
+        """
+        Updates the Active Context and extracts the Intent.
+        Fixes 'Summary Bloat' by aggressively discarding old topics.
+        """
+        
+        prompt = (
+            "You are a State Manager. Update the 'Active Context' and 'Current Intent'.\n"
+            "1. Active Context: Summarize ONLY the current topic. Discard old, finished topics. Be concise.\n"
+            "2. Current Intent: What is the user primarily looking for? (e.g., 'listing friends', 'comparing dates', 'asking biography').\n\n"
+            f"Old Context: {self.active_context}\n"
+            f"Most Recent Interaction -> Q: {rewritten_q} | A: {last_a}\n\n"
+            "Output JSON format: {\"context\": \"...\", \"intent\": \"...\"}"
+        )
+        
+        try:
+            response = self.llm.invoke(prompt).content.strip()
+            # Basic cleanup to ensure JSON parsing
+            clean_json = response.replace("```json", "").replace("```", "")
+            data = json.loads(clean_json)
+            
+            self.active_context = data.get("context", "")
+            self.current_intent = data.get("intent", "General inquiry")
+            
+            self.console.print(f"[dim]🧠 Memory: {self.active_context} | Intent: {self.current_intent}[/dim]")
+        except Exception as e:
+            # Fallback if JSON fails
+            self.active_context = f"Last discussed: {rewritten_q}"
+
+    def _retrieve_long_term_memory(self, query: str) -> str:
+        """Retrieves episodic memory from Vector Store."""
+        if not self.vs: return ""
+        retriever = self.vs.get_hybrid_retriever(k=3)
+        if not retriever: return ""
+        try:
+            docs = retriever.invoke(query)
+            memories = [d.page_content for d in docs if d.metadata.get("source_type") == "episodic_memory"]
+            return "\n".join(memories) if memories else ""
+        except: return ""
+
+    def _calculate_triad_metrics(self, question: str, answer: str, context_chunks: list) -> dict:
+        """Deterministic RAG Triad Metrics."""
+        if not context_chunks: return {}
+        q_emb = self.vs.emb.embed_query(question)
+        a_emb = self.vs.emb.embed_query(answer)
+        c_embs = [self.vs.emb.embed_query(c) for c in context_chunks[:3]]
+        ctx_rel = np.mean([util.cos_sim(q_emb, c).item() for c in c_embs]) if c_embs else 0
+        ans_rel = util.cos_sim(q_emb, a_emb).item()
+        return {"context_rel": round(max(0, ctx_rel), 2), "answer_rel": round(max(0, ans_rel), 2)}
 
     def answer(self, question: str, doc_id: Optional[str] = None):
         t_start = time.time()
-        metrics = {
-            "retrieval_ms": 0, "llm_ms": 0, "eval_ms": 0,
-            "candidates_fetched": 0, "chunks_used": 0, "filtered_out": 0,
-            "faithfulness": 0.0, "relevance": 0.0 
-        }
-
-        # 1. Broad Retrieval 
-        retriever = self.vs.get_hybrid_retriever(k=60)
-        if not retriever:
-             self.console.print("[red]Database is empty.[/red]")
-             return
-
-        t0 = time.time()
-        raw_candidates = retriever.invoke(question)
-        metrics["retrieval_ms"] = round((time.time() - t0) * 1000, 2)
-        metrics["candidates_fetched"] = len(raw_candidates)
-
-        # 2. Security Filtering
-        valid_docs = []
-        for doc in raw_candidates:
-            meta = doc.metadata
-            if doc_id and meta.get("doc_id") != doc_id:
-                metrics["filtered_out"] += 1
-                continue
-            if not role_allows(self.role, meta.get("sensitivity", "low")):
-                metrics["filtered_out"] += 1
-                continue
-            valid_docs.append(doc)
-
-        final_context = valid_docs[:15]
-        metrics["chunks_used"] = len(final_context)
         
-        if not final_context:
-            self._print_response("Information not found (Access Denied or No Data).", [], metrics, t_start)
+        # --- STEP 1: Query Transformation (Fixes Intent Drift) ---
+        # Instead of searching for "And Voldemort", we search for "Who are Voldemort's friends?"
+        standalone_query = self._rewrite_query(question)
+        
+        # --- STEP 2: Retrieval (using Standalone Query) ---
+        # Now retrieval is focused on the PREDICATE (friends), not just the ENTITY (Voldemort).
+        retriever = self.vs.get_hybrid_retriever(k=15)
+        raw_docs = retriever.invoke(standalone_query) if retriever else []
+        
+        allowed_docs = [d for d in raw_docs if role_allows(self.role, d.metadata.get("sensitivity", "low"))]
+        past_memories = self._retrieve_long_term_memory(standalone_query)
+
+        # Prepare Context
+        context_text = ""
+        citations = []
+        chunks_for_metric = []
+        for i, d in enumerate(allowed_docs[:10]):
+            clean = " ".join(d.page_content.split())
+            context_text += f"Source [{i+1}]: {clean}\n\n"
+            chunks_for_metric.append(clean)
+            citations.append({"id": i+1, "file": d.metadata.get('doc_id'), "loc": f"Pg {d.metadata.get('page')}"})
+
+        # --- STEP 3: Generation (Strictly Grounded) ---
+        # We explicitly tell the LLM the User's Intent to keep it focused.
+        sys_msg = (
+            "You are a Strict RAG Assistant. "
+            f"Current Intent: {self.current_intent.upper()}.\n" 
+            "1. Answer ONLY what is asked based on Documents.\n"
+            "2. If the documents describe the entity but do NOT contain info matching the Intent (e.g., no friends mentioned), "
+            "state clearly: 'The documents do not contain information about [Intent] for [Entity].' \n"
+            "3. Do NOT provide a generic biography.\n"
+        )
+        
+        user_msg = (
+            f"CONTEXT:\n{context_text}\n\n"
+            f"MEMORY:\n{past_memories}\n\n"
+            f"QUESTION: {standalone_query}" # We feed the rewritten query to the LLM too
+        )
+        
+        try:
+            raw_response = self.llm.invoke([("system", sys_msg), ("human", user_msg)]).content
+            final_answer = raw_response.strip()
+        except Exception as e:
+            self.console.print(f"[red]LLM Error: {e}[/red]")
             return
 
-        # 3. Context Preparation
-        context_parts = []
-        citations_data = []
-        full_context_text = "" # For judge
+        # --- STEP 4: State Update (Fixes Memory Bloat) ---
+        self._update_state(question, final_answer, standalone_query)
+        self._save_session()
         
-        for i, d in enumerate(final_context):
-            meta = d.metadata
-            ref_idx = i + 1
-            
-            if meta.get("source_type") == "table_markdown":
-                loc = f"Row: {meta.get('row_idx')}"
-                icon = "📊"
-            else:
-                loc = f"Page: {meta.get('page')}"
-                icon = "📄"
-            
-            citations_data.append({
-                "id": ref_idx, "file": meta.get('doc_id'), 
-                "loc": loc, "type": icon, "access": meta.get("sensitivity", "low")
-            })
-            
-            clean_text = " ".join(d.page_content.split())
-            context_parts.append(f"Source [{ref_idx}]: {clean_text}")
-            full_context_text += f"\nSource [{ref_idx}]: {clean_text}"
+        # Index into Long Term Memory
+        self.vs.add_memory_trace(f"Q: {standalone_query}\nA: {final_answer}", self.role)
 
-        # 4. Generation
-        prompt_text = self._build_prompt(question, context_parts)
-        t1 = time.time()
-        try:
-
-            raw_response = self.llm.invoke(prompt_text).content
-            response_text = self._normalize_llm_text(raw_response)
-        except Exception as e:
-            self._print_response(
-                "⚠️ Temporary LLM error. Please retry later.",
-                [],
-                metrics,
-                t_start
-            )
-            return
-
-        metrics["llm_ms"] = round((time.time() - t1) * 1000, 2)
-
-        # 5. Quality Evaluation (LLM-as-a-Judge)
-        t2 = time.time()
-        f_score, r_score = self._evaluate_quality(question, response_text, full_context_text)
-        metrics["faithfulness"] = f_score
-        metrics["relevance"] = r_score
-        metrics["eval_ms"] = round((time.time() - t2) * 1000, 2)
-        
-        # 6. Output
-        self._print_response(response_text, citations_data, metrics, t_start)
-
-    def _evaluate_quality(self, question: str, answer: str, context: str) -> Tuple[float, float]:
-        faith_prompt = (
-            "You are a strict evaluator. Analyze if the ANSWER is strictly supported by the CONTEXT.\n"
-            "Return a single numeric score between 0.0 and 1.0 (inclusive) on the first line, "
-            "optionally followed by a short explanation on subsequent lines.\n\n"
-            f"CONTEXT:\n{context}\n\n"
-            f"ANSWER: {answer}\n\n"
-            "Return ONLY the number on the first line, e.g. '0.85'."
-        )
-
-        rel_prompt = (
-            "You are a strict evaluator. Analyze if the ANSWER directly addresses the QUESTION.\n"
-            "Return a single numeric score between 0.0 and 1.0 (inclusive) on the first line, "
-            "optionally followed by a short explanation.\n\n"
-            f"QUESTION: {question}\n"
-            f"ANSWER: {answer}\n\n"
-            "Return ONLY the number on the first line, e.g. '0.95'."
-        )
-
-        def parse_score(text: str) -> float:
-            if not text:
-                return 0.0
-            t = text.strip()
-            # Try common patterns: 0.85 or 1.0 or 0 or 1
-            m = re.search(r"(?<!\d)(0(?:[.,]\d+)?|1(?:[.,]0+)?)(?!\d)", t)
-            if m:
-                s = m.group(1).replace(",", ".")
-                try:
-                    val = float(s)
-                    return max(0.0, min(1.0, val))
-                except Exception:
-                    pass
-            # Try percent like "85%" or "85.0 %"
-            m2 = re.search(r"(\d+(?:[.,]\d+)?)\s*%", t)
-            if m2:
-                try:
-                    val = float(m2.group(1).replace(",", "."))
-                    return max(0.0, min(1.0, val / 100.0))
-                except Exception:
-                    pass
-            # Try bare number possibly >1 (e.g. "85" meaning 85%)
-            m3 = re.search(r"(?<!\d)(\d+(?:[.,]\d+)?)(?!\d)", t)
-            if m3:
-                try:
-                    val = float(m3.group(1).replace(",", "."))
-                    if val > 1.0:
-                        # interpret as percentage
-                        val = val / 100.0
-                    return max(0.0, min(1.0, val))
-                except Exception:
-                    pass
-            return 0.0
-
-        try:
-            f_resp = self.judge_llm.invoke(faith_prompt).content
-            r_resp = self.judge_llm.invoke(rel_prompt).content
-
-
-            self.console.print(f"[dim]Judge faith raw response:[/dim]\n{f_resp}\n")
-            self.console.print(f"[dim]Judge rel  raw response:[/dim]\n{r_resp}\n")
-
-            f_score = parse_score(f_resp)
-            r_score = parse_score(r_resp)
-            return f_score, r_score
-        except Exception as e:
-            self.console.print(f"[red]Judge invocation error:[/red] {e}")
-            return 0.0, 0.0
-
-
-    def _build_prompt(self, question, context):
-        ctx = "\n\n".join(context)
-        sys = (
-            "You are a secure corporate analyst. Use ONLY the provided CONTEXT. "
-            "If the answer is missing, state 'Information not found'. "
-            "Use [1], [2] citation style."
-        )
-        return [("system", sys), ("human", f"CONTEXT:\n{ctx}\n\nQUESTION: {question}")]
-
-    def _print_response(self, text: str, citations: List[Dict], metrics: Dict, t_start: float):
+        # Output
+        metrics = self._calculate_triad_metrics(standalone_query, final_answer, chunks_for_metric)
         total_time = round(time.time() - t_start, 2)
         
-        # Answer
-        self.console.print(Panel(text, title="[bold green]RAG Response[/bold green]", border_style="green"))
+        self.console.print(Panel(final_answer, title=f"DH-RAG (Intent: {self.current_intent})", border_style="green"))
         
-        # Sources
         if citations:
-            ref_table = Table(title="Sources Used", box=box.SIMPLE)
-            ref_table.add_column("Ref", justify="center", style="cyan")
-            ref_table.add_column("Type", justify="center")
-            ref_table.add_column("Document", style="magenta")
-            ref_table.add_column("Location", style="yellow")
-            
-            for c in citations:
-                ref_table.add_row(f"[{c['id']}]", c['type'], c['file'], c['loc'])
+            ref_table = Table(title="Sources", box=box.SIMPLE)
+            ref_table.add_column("Ref"); ref_table.add_column("Doc"); ref_table.add_column("Loc")
+            for c in citations[:5]:
+                ref_table.add_row(f"[{c['id']}]", c['file'], c['loc'])
             self.console.print(ref_table)
 
-        # Quality Metrics 
-        def color_score(score):
-            if score >= 0.8: return f"[green]{score}[/green]"
-            if score >= 0.5: return f"[yellow]{score}[/yellow]"
-            return f"[red]{score}[/red]"
-
-        q_table = Table(box=box.ROUNDED, show_header=True, title="Quality Assurance (LLM-as-a-Judge)")
-        q_table.add_column("Metric")
-        q_table.add_column("Score (0-1)")
-        q_table.add_column("Meaning")
-        
-        q_table.add_row(
-            "Faithfulness", 
-            color_score(metrics['faithfulness']), 
-            "Is the answer grounded in context?"
-        )
-        q_table.add_row(
-            "Relevance", 
-            color_score(metrics['relevance']), 
-            "Does it answer the user's question?"
-        )
-        self.console.print(q_table)
-
-        # Technical Metrics
-        tech_table = Table(box=box.SIMPLE, show_header=False)
-        tech_table.add_row(f"⏱️ Total: {total_time}s", f"Pipe: {metrics['candidates_fetched']}->{metrics['chunks_used']} docs")
-        self.console.print(tech_table)
-        
-    def _normalize_llm_text(self, content) -> str:
-
-        if content is None:
-            return ""
-
-        if isinstance(content, str):
-            return content
-
-        # Gemini structured response: list[dict]
-        if isinstance(content, list):
-            texts = []
-            for item in content:
-                if isinstance(item, dict):
-                    if "text" in item and isinstance(item["text"], str):
-                        texts.append(item["text"])
-            return "\n".join(texts).strip()
-
-        # dict fallback
-        if isinstance(content, dict):
-            if "text" in content and isinstance(content["text"], str):
-                return content["text"]
-
-        # last resort
-        return str(content)
+        self.console.print(f"[dim]Metrics: CtxRel={metrics.get('context_rel',0)} | AnsRel={metrics.get('answer_rel',0)} | Time={total_time}s[/dim]")
