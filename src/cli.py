@@ -52,5 +52,27 @@ def query(
     
     engine.answer(question=q, doc_id=doc_id)
 
+@app.command()
+def chat(
+    role: str = typer.Option(..., help="Your role (admin/low_rank)"),
+    doc_id: str = typer.Option(None, help="Filter by document ID")
+):
+    """
+    Interactive chat: does not close after a question and remembers context in memory.
+    """
+    engine = RagEngine(role=role)
+    print(f"[bold green]Entering chat mode (Role: {role}). Type 'exit' to leave.[/bold green]")
+    
+    while True:
+        # Typer prompt for input
+        question = typer.prompt("You")
+        
+        if question.lower() in ["exit", "quit", "leave"]:
+            break
+            
+        # Call the main method (it will contextualize and output the answer)
+        engine.answer(question, doc_id=doc_id)
+
+
 if __name__ == "__main__":
     app()

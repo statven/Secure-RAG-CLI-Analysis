@@ -24,8 +24,6 @@ class RagEngine:
         self.vs = VectorStoreClient()
         self.console = Console()
         
-        # --- DH-RAG v2 Components ---
-        
         # 1. Active Context (Structured State)
         # Instead of just a text log, we treat summary as the "Active Working Memory".
         self.active_context = "" 
@@ -37,7 +35,7 @@ class RagEngine:
         self.history_file = Path("data/chat_session.json")
         self._load_session() 
         
-        main_model_name = "gemini-2.5-flash-lite"
+        main_model_name = "gemini-2.5-flash"
         
         if not os.getenv("GOOGLE_API_KEY"):
             raise ValueError("GOOGLE_API_KEY env var missing")
