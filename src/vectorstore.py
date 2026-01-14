@@ -1,5 +1,7 @@
 import os
 import shutil
+import uuid 
+from datetime import datetime 
 from typing import List, Dict, Any
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -49,6 +51,28 @@ class VectorStoreClient:
             self.vs.add_documents([Document(page_content=t, metadata=m) for t, m in zip(texts, metadatas)])
         
         self._save_index()
+    def add_memory_trace(self, text: str, role: str):
+        """
+        Indexes a piece of conversation history as a retrievable memory trace.
+        This enables 'Long-Term Memory' for the DH-RAG system.
+        """
+        if not text: return
+
+        meta = {
+            "doc_id": f"memory_{uuid.uuid4().hex[:8]}",
+            "source_type": "episodic_memory", 
+            "created_at": str(datetime.now()),
+            "sensitivity": "low", 
+            "role_context": role
+        }
+        
+        # Embed and add immediately
+        if self.vs is None:
+            self.vs = FAISS.from_texts([text], self.emb, metadatas=[meta])
+        else:
+            self.vs.add_texts([text], metadatas=[meta])
+            
+        self._save_index()
 
     def get_hybrid_retriever(self, k: int = 30):
         if self.vs is None:
@@ -68,6 +92,7 @@ class VectorStoreClient:
         # 3. Ensemble (Weights: 0.5 semantic, 0.5 keyword)
         ensemble_retriever = EnsembleRetriever(
             retrievers=[bm25_retriever, faiss_retriever],
-            weights=[0.3, 0.7]
+            weights=[0.8, 0.2]
         )
         return ensemble_retriever
+    
