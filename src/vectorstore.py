@@ -92,7 +92,7 @@ class VectorStoreClient:
         # 3. Ensemble (Weights: 0.5 semantic, 0.5 keyword)
         ensemble_retriever = EnsembleRetriever(
             retrievers=[bm25_retriever, faiss_retriever],
-            weights=[0.8, 0.2]
+            weights=[0.3, 0.7] # More weight on FAISS because queries are still vague; BM25 stays as a keyword safety net
         )
         return ensemble_retriever
     
