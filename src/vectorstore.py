@@ -11,7 +11,7 @@ from llama_index.vector_stores.faiss import FaissVectorStore
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 import faiss
 
-# Параметры
+# Parameters
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 PERSIST_DIR = "data/storage"
 
