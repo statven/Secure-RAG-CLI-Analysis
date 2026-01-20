@@ -31,6 +31,19 @@ SEPARATORS = [
     r"\d+\.\s"      # numbered lists like "1. "
 ]
 
+
+SEPARATORS = [
+    "\n\n",
+    "\n",
+    "(?<=\. )", 
+    " ",
+    "",
+    "\u2022",  # Bullet point
+    "- ",
+    "* ",
+    r"\d+\.\s" # Numbered lists (1. , 2. )
+]
+
 def extract_text_from_pdf(path: str) -> List[Dict[str, Any]]:
     if fitz is None:
         raise RuntimeError("PyMuPDF not installed")
