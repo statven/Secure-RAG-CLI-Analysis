@@ -25,10 +25,11 @@ def ingest(
         print(f"[red]File not found: {file}[/red]")
         raise typer.Exit(code=1)
         
-    doc_id = doc_id or file.stem 
+    doc_id = doc_id or file.stem #  use the filename without the extension as the ID
+    
     try:
         ingest_file(str(file), doc_id=doc_id, sensitivity=sensitivity)
-        
+        #More informative output
         color = "red" if sensitivity == LEVEL_HIGH else "green"
         print(f"[bold]Ingested:[/bold] {doc_id}")
         print(f"[bold]Security Level:[/bold] [{color}]{sensitivity}[/{color}]")
@@ -36,7 +37,7 @@ def ingest(
     except ValueError as e:
         print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=1)
-
+# Chat mode for convenience
 @app.command()
 def query(
     file: Path = typer.Option(None, help="(optional) file to auto-ingest before query"),

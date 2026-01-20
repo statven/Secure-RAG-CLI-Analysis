@@ -93,9 +93,9 @@ def extract_from_table(path: str) -> List[Dict[str, Any]]:
 
 def chunk_texts(pages: List[Dict[str, Any]], doc_id: str, file_sensitivity: str):
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        separators=SEPARATORS,
+        chunk_size=CHUNK_SIZE, # Defines the maximum size of text chunks.
+        chunk_overlap=CHUNK_OVERLAP,#Specifies the amount of overlap between chunks for context retention.
+        separators=SEPARATORS,# Lists characters or patterns used to split the text into chunks.
         is_separator_regex=True
     )
 

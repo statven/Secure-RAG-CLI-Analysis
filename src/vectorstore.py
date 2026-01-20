@@ -5,9 +5,7 @@ from datetime import datetime
 from typing import List, Dict, Any
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-
-
-from langchain_classic.retrievers import EnsembleRetriever
+from langchain_classic.retrievers import EnsembleRetriever #  combines multiple retrieval strategies to enhance document retrieval.
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 
