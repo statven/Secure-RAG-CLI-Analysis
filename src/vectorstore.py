@@ -5,9 +5,7 @@ from datetime import datetime
 from typing import List, Dict, Any
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-
-
-from langchain_classic.retrievers import EnsembleRetriever
+from langchain_classic.retrievers import EnsembleRetriever #  combines multiple retrieval strategies to enhance document retrieval.
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 
@@ -89,7 +87,7 @@ class VectorStoreClient:
         bm25_retriever = BM25Retriever.from_documents(all_docs)
         bm25_retriever.k = k
         
-        # 3. Ensemble (Weights: 0.5 semantic, 0.5 keyword)
+
         ensemble_retriever = EnsembleRetriever(
             retrievers=[bm25_retriever, faiss_retriever],
             weights=[0.3, 0.7] # More weight on FAISS because queries are still vague; BM25 stays as a keyword safety net

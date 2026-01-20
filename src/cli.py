@@ -25,10 +25,11 @@ def ingest(
         print(f"[red]File not found: {file}[/red]")
         raise typer.Exit(code=1)
         
-    doc_id = doc_id or file.stem 
+    doc_id = doc_id or file.stem #  use the filename without the extension as the ID
+    
     try:
         ingest_file(str(file), doc_id=doc_id, sensitivity=sensitivity)
-        
+        #More informative output
         color = "red" if sensitivity == LEVEL_HIGH else "green"
         print(f"[bold]Ingested:[/bold] {doc_id}")
         print(f"[bold]Security Level:[/bold] [{color}]{sensitivity}[/{color}]")
@@ -36,7 +37,7 @@ def ingest(
     except ValueError as e:
         print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=1)
-
+# Chat mode for convenience
 @app.command()
 def query(
     file: Path = typer.Option(None, help="(optional) file to auto-ingest before query"),
@@ -51,6 +52,28 @@ def query(
     engine = RagEngine(role=role)
     
     engine.answer(question=q, doc_id=doc_id)
+
+@app.command()
+def chat(
+    role: str = typer.Option(..., help="Your role (admin/low_rank)"),
+    doc_id: str = typer.Option(None, help="Filter by document ID")
+):
+    """
+    Interactive chat: does not close after a question and remembers context in memory.
+    """
+    engine = RagEngine(role=role)
+    print(f"[bold green]Entering chat mode (Role: {role}). Type 'exit' to leave.[/bold green]")
+    
+    while True:
+        # Typer prompt for input
+        question = typer.prompt("You")
+        
+        if question.lower() in ["exit", "quit", "leave"]:
+            break
+            
+        # Call the main method (it will contextualize and output the answer)
+        engine.answer(question, doc_id=doc_id)
+
 
 if __name__ == "__main__":
     app()
