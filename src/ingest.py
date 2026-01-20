@@ -1,6 +1,5 @@
 import os
 import json
-import re
 from pathlib import Path
 from typing import List, Dict, Any
 import pandas as pd
@@ -14,22 +13,13 @@ try:
 except ImportError:
     docx = None
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from llama_index.core import Document
+from llama_index.core.node_parser import SentenceSplitter
 from src.vectorstore import VectorStoreClient
 from src.security import validate_sensitivity
 
 CHUNK_SIZE = 1000  
 CHUNK_OVERLAP = 200 
-
-SEPARATORS = [
-    r"\n\n",        # paragraph breaks
-    r"\n",          # single newlines
-    r"(?<=\.\s)",   # split after sentence-ending period + space
-    r"\u2022",      # bullet
-    r"-\s",         # dash + space
-    r"\*\s",        # asterisk lists
-    r"\d+\.\s"      # numbered lists like "1. "
-]
 
 def extract_text_from_pdf(path: str) -> List[Dict[str, Any]]:
     if fitz is None:
@@ -45,19 +35,14 @@ def extract_text_from_docx(path: str) -> List[Dict[str, Any]]:
     if docx is None:
         raise RuntimeError("python-docx not installed")
     d = docx.Document(path)
-    pages = []
     full_text = []
-    
-    #collect all the text so that the splitter can sort out the sub-items itself.
     for p in d.paragraphs:
         if p.text.strip():
             full_text.append(p.text)
-            
-    # saving the pages as a single stream with a marker
-    pages.append({"page": 1, "text": "\n".join(full_text), "source_type": "docx"})
-    return pages
+    return [{"page": 1, "text": "\n".join(full_text), "source_type": "docx"}]
 
 def extract_from_table(path: str) -> List[Dict[str, Any]]:
+    """Custom logic to convert Table rows into Markdown chunks."""
     df = pd.read_csv(path) if path.lower().endswith(".csv") else pd.read_excel(path)
     df = df.fillna("")
 
@@ -66,9 +51,8 @@ def extract_from_table(path: str) -> List[Dict[str, Any]]:
     separator = "| " + " | ".join(["---"] * len(columns)) + " |"
 
     chunks = []
-    batch_size = 5  # grouping 5 rows to preserve the context of neighbors.
+    batch_size = 5  
 
-    # assign a page number for each batch so table chunks get different page metadata
     for i in range(0, len(df), batch_size):
         batch = df.iloc[i : i+batch_size]
         text_lines = [header, separator]
@@ -78,9 +62,8 @@ def extract_from_table(path: str) -> List[Dict[str, Any]]:
             text_lines.append(row_str)
 
         chunk_text = "\n".join(text_lines)
-
-        # page number is batch index + 1
         page_no = (i // batch_size) + 1
+        
         chunks.append({
             "page": page_no,
             "row_start": i+1,
@@ -90,37 +73,32 @@ def extract_from_table(path: str) -> List[Dict[str, Any]]:
         })
     return chunks
 
-
-def chunk_texts(pages: List[Dict[str, Any]], doc_id: str, file_sensitivity: str):
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE, # Defines the maximum size of text chunks.
-        chunk_overlap=CHUNK_OVERLAP,#Specifies the amount of overlap between chunks for context retention.
-        separators=SEPARATORS,# Lists characters or patterns used to split the text into chunks.
-        is_separator_regex=True
-    )
-
-    chunks = []
-    global_counter = 0  # unique counter across the whole document
+def create_documents(pages: List[Dict[str, Any]], doc_id: str, file_sensitivity: str) -> List[Document]:
+    """
+    Splits text and creates LlamaIndex Document objects (Nodes).
+    """
+    # LlamaIndex splitter
+    splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    
+    docs_to_insert = []
+    global_counter = 0
 
     for p in pages:
         raw_text = (p.get("text") or "").strip()
         if not raw_text:
             continue
 
+        # If it's our custom table markdown, we treat the whole batch as one chunk
         if p.get("source_type") == "table_markdown":
-            parts = [raw_text]
+            text_chunks = [raw_text]
         else:
-            parts = splitter.split_text(raw_text)
+            text_chunks = splitter.split_text(raw_text)
 
         page_no = p.get("page", 1)
-        for local_idx, part in enumerate(parts):
-            text_part = (part or "").strip()
-            if not text_part:
-                continue
 
-            # Produce a globally unique chunk id: includes doc_id, page and a global counter
+        for part in text_chunks:
             chunk_id = f"{doc_id}_p{page_no}_{global_counter}"
-
+            
             metadata = {
                 "doc_id": doc_id,
                 "page": page_no,
@@ -128,14 +106,22 @@ def chunk_texts(pages: List[Dict[str, Any]], doc_id: str, file_sensitivity: str)
                 "source_type": p.get("source_type", "unknown"),
                 "sensitivity": file_sensitivity
             }
+            
             if "row_start" in p:
                 metadata["row_idx"] = f"{p['row_start']}-{p['row_end']}"
 
-            chunks.append({"text": text_part, "metadata": metadata})
+            # Create LlamaIndex Document (which will become a Node in the index)
+            # We explicitly set doc_id so we can overwrite it later (upsert logic)
+            doc = Document(text=part, metadata=metadata)
+            doc.doc_id = chunk_id # Internal ID for node
+            
+            # Important: set ref_doc_id to the file ID so we can delete the whole file later
+            doc.metadata["ref_doc_id"] = doc_id 
+            
+            docs_to_insert.append(doc)
             global_counter += 1
 
-    return chunks
-
+    return docs_to_insert
 
 def ingest_file(path: str, doc_id: str, sensitivity: str):
     path_obj = Path(path)
@@ -153,27 +139,28 @@ def ingest_file(path: str, doc_id: str, sensitivity: str):
     }
 
     ext = path_obj.suffix.lower()
-    
     handler = handlers.get(ext)
     if not handler:
         raise RuntimeError(f"Unsupported extension: {ext}")
-    pages = handler(path_obj)
-
-    clean_sensitivity = validate_sensitivity(sensitivity)
-    chunks = chunk_texts(pages, doc_id, file_sensitivity=clean_sensitivity)
     
-    vs = VectorStoreClient()
+    pages = handler(path_obj)
+    clean_sensitivity = validate_sensitivity(sensitivity)
+    
+    # Convert to LlamaIndex Documents
+    nodes = create_documents(pages, doc_id, clean_sensitivity)
+    
+    # Upsert to VectorStore
+    vs_client = VectorStoreClient()
+    vs_client.upsert_document(doc_id, nodes)
+    
+    # Manifest saving (Metadata)
     manifests_dir = Path("data") / "manifests"
     manifests_dir.mkdir(parents=True, exist_ok=True)
-    full_text = " ".join([p.get("text","") for p in pages])
-    (manifests_dir / f"{doc_id}.txt").write_text(full_text, encoding="utf-8")
-    vs.upsert_document(doc_id, chunks) # enw meth upsert
     
-    # Saving the manifesto
     man_path = Path("data") / f"{doc_id}_manifest.json"
     man_path.parent.mkdir(exist_ok=True)
     man_path.write_text(json.dumps({
         "doc_id": doc_id, 
         "sensitivity": clean_sensitivity,
-        "num_chunks": len(chunks)
+        "num_chunks": len(nodes)
     }), encoding="utf-8")
