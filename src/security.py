@@ -1,4 +1,3 @@
-# src/security.py
 from typing import Dict, Any
 
 
@@ -7,7 +6,7 @@ LEVEL_HIGH = "high"
 VALID_LEVELS = [LEVEL_LOW, LEVEL_HIGH]
 
 def validate_sensitivity(level: str) -> str:
-    """Проверяет, что введенный уровень корректен."""
+    """Checks that the entered level is correct."""
     level = level.lower().strip()
     if level not in VALID_LEVELS:
         raise ValueError(f"Invalid sensitivity level: '{level}'. Allowed: {VALID_LEVELS}")
@@ -16,8 +15,8 @@ def validate_sensitivity(level: str) -> str:
 def role_allows(user_role: str, chunk_sensitivity: str) -> bool:
     """
     RBAC Logic:
-    - Admin/High_rank видит всё.
-    - Low_rank видит только 'low'.
+    - Admin/High_rank sees everything
+    - Low_rank only sees 'low'.
     """
     user_role = user_role.lower()
     chunk_sensitivity = chunk_sensitivity.lower()
