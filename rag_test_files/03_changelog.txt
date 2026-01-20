@@ -1,0 +1,15 @@
+# Changelog for SmartHome Climate Control
+Created: 2025-01-07
+Author: QA Team
+
+v0.1 - Initial commit ✅
+ - Added sensors module
+ - Added edge aggregator
+
+-- NOTES --
+Some unicode examples: Привет, Δέλτα, 中文字符, emoji: 😊
+
+Embedded JSON for quick parse:
+{"release":"0.1","date":"2025-01-07","notes":["initial","sensors","edge"]}
+
+End of file.
