@@ -27,7 +27,7 @@ import subprocess
 import tempfile
 import ast
 import textwrap
-
+#Enhanced logic and protection for mathematics
 class SafePythonRunner:
     def __init__(self, timeout: int = 5, max_output_chars: int = 2000):
         self.timeout = timeout
@@ -199,6 +199,7 @@ class RagEngine:
             "REPLY EXACTLY WITH JSON: {\"is_math\": true/false, \"plan\":\"...\"}\n"
              f"Question: {question}\nContext: {context_text[:2000]}"
         )
+        #Checking the necessity of performing calculations
 
         resp = self.llm.complete(check_prompt)
         txt = resp.text.strip()
@@ -463,7 +464,7 @@ class RagEngine:
             ref_table.add_column("Ref"); ref_table.add_column("Doc"); ref_table.add_column("Loc")
             
             seen = set()
-            for c in citations[:40]:
+            for c in citations[:40]:#More links to documents displayed to the user (More informative UI)
                 if c['id'] not in seen:
                     ref_table.add_row(f"[{c['id']}]", c['file'], f"{c['loc']}\n{c['snippet']}")
                     seen.add(c['id'])
