@@ -23,27 +23,76 @@ from rich.table import Table
 from rich.panel import Panel
 from rich import box
 
-# Python REPL implementation to replace LangChain 
-class SimplePythonREPL:
-    def run(self, command: str) -> str:
-        """Executes python code and captures stdout."""
-        old_stdout = sys.stdout
-        redirected_output = sys.stdout = io.StringIO()
+import subprocess
+import tempfile
+import ast
+import textwrap
+#Enhanced logic and protection for mathematics
+class SafePythonRunner:
+    def __init__(self, timeout: int = 5, max_output_chars: int = 2000):
+        self.timeout = timeout
+        self.max_output_chars = max_output_chars
+
+    def _validate_ast(self, src: str):
+        tree = ast.parse(src)
+        banned_names = {"open","exec","eval","__import__","compile","os","sys","subprocess","socket"}
+        for node in ast.walk(tree):
+            # forbid import of unsafe modules
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for n in node.names:
+                    if n.name and any(b in n.name for b in banned_names):
+                        raise ValueError(f"Forbidden import: {n.name}")
+            # forbid calls to banned names
+            if isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Name) and func.id in banned_names:
+                    raise ValueError(f"Forbidden function call: {func.id}")
+        return True
+
+    def run(self, user_code: str) -> str:
+        # Minimal wrapper: provide context_str variable if referenced externally
+        wrapper = textwrap.dedent(f"""
+        import json
+        import pandas as pd
+        import numpy as np
+        import io
+        context_str = globals().get('context_str', '')
         try:
-            exec_globals = {}
-            exec(command, exec_globals)
-            return redirected_output.getvalue()
+{self._indent_code(user_code, 12)}
         except Exception as e:
-            return str(e)
+            print('<<EXC>>' + str(e))
+        """)
+        # Validate
+        self._validate_ast(wrapper)
+        # write to temp file and run in subprocess with timeout
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as f:
+            f.write(wrapper)
+            path = f.name
+        try:
+            proc = subprocess.run([sys.executable, path],
+                                  capture_output=True, text=True, timeout=self.timeout)
+            out = proc.stdout or proc.stderr or ""
+            return out[: self.max_output_chars]
+        except subprocess.TimeoutExpired:
+            return "ERROR: execution timeout"
         finally:
-            sys.stdout = old_stdout
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+    def _indent_code(self, code: str, spaces: int) -> str:
+        pad = " " * spaces
+        return "\n".join(pad + line if line.strip() else line for line in code.splitlines())
+
 
 class RagEngine:
     def __init__(self, role: str = "low_rank", model_type: str = "flash"):
+        
         self.role = role
         self.vs_client = VectorStoreClient()
         self.console = Console()
-        self.python_repl = SimplePythonREPL()
+        self.python_repl = SafePythonRunner(timeout=5)
         
         # --- Config LLM ---
         if not os.getenv("GOOGLE_API_KEY"):
@@ -123,15 +172,13 @@ class RagEngine:
     def _retrieve_docs(self, query: str) -> List[Any]:
         """Retrieves and filters documents based on RBAC."""
         # Retrieve more docs initially to allow for filtering
-        retriever = self.vs_client.get_retriever(k=40)
+        retriever = self.vs_client.get_retriever(k=50)
         nodes = retriever.retrieve(query)
-        
         allowed_nodes = []
         for n in nodes:
             sensitivity = n.metadata.get("sensitivity", "low")
             if role_allows(self.role, sensitivity):
                 allowed_nodes.append(n)
-        
         return allowed_nodes
 
     def _retrieve_long_term_memory(self, query: str) -> str:
@@ -141,6 +188,7 @@ class RagEngine:
         return "\n".join(memories[:5]) if memories else ""
 
     def _handle_math_operations(self, question: str, context_text: str) -> Optional[str]:
+        # 1) Math detection -> expect JSON
         check_prompt = (
             f"Question: '{question}'\n"
             "Does answering this require mathematical calculation (sum, average, count, difference) "
@@ -148,45 +196,40 @@ class RagEngine:
             "If YES, in the next line output a very short PLAN describing which operation(s) to perform "
             "(e.g. 'PLAN: sum column A grouped by B').\n"
             "No extra text.\n"
+            "REPLY EXACTLY WITH JSON: {\"is_math\": true/false, \"plan\":\"...\"}\n"
+             f"Question: {question}\nContext: {context_text[:2000]}"
         )
+        #Checking the necessity of performing calculations
 
         resp = self.llm.complete(check_prompt)
-        is_math = resp.text.strip().upper()
-        if not is_math.startswith("YES"):
+        txt = resp.text.strip()
+        try:
+            parsed = json.loads(txt)
+        except:
+            # try to extract JSON substring or fallback to NO
             return None
-        # We could capture plan = second line for better introspection (optional)
-
+        if not parsed.get("is_math"):
+            return None
+        plan = parsed.get("plan","")
         
-        if "YES" not in is_math:
-            return None
-
+        # 2) Request code in JSON
         self.console.print("[yellow] Math detected. Executing Code Interpreter...[/yellow]")
         code_prompt = (
-            "You are a Python Data Analyst. Return ONLY executable Python code (no markdown, no explanation).\n"
-            "CONSTRAINTS: no network calls, no file system writes, do not import unknown packages, "
-            "use only pandas, numpy, io. The variable `context_str` (string) contains the textual context "
-            "(may include Markdown tables using | separators).\n\n"
-            "REQUIREMENTS:\n"
-            "1) Parse any Markdown-style tables in `context_str` using io.StringIO and pd.read_csv(..., sep='|').\n"
-            "2) Clean column names (strip, lower).\n"
-            "3) Compute the values needed to answer the question.\n"
-            "4) PRINT only the final answer on a single line.\n\n"
-            f"User Question: {question}\n"
+            "You are a Python Data Analyst. RETURN A JSON OBJECT: {\"code\": \"<python code>\"}\n"
+            "Constraints: no network, no file writes; only use pandas, numpy, io. Print final answer only.\n"
             f"context_str = '''{context_text[:6000]}'''\n"
-            "Provide just the code now:"
+            f"Question: {question}\n"
         )
 
         
         try:
             resp = self.llm.complete(code_prompt)
-            code = resp.text.strip()
-            code = code.replace("```python", "").replace("```", "").strip()
-            # Add a short wrapper to ensure safe imports
-            full_code = (
-                "import pandas as pd\nimport io\nimport numpy as np\n"
-                "__context__ = context_str\n"
-                + code
-            )
+            txt = resp.text.strip()
+            code_json = json.loads(self._extract_json(txt))
+            code = code_json.get("code","")
+            # 3) Run code in sandbox
+            # prepend a safe header so context_str is available
+            full_code = "context_str = '''{}'''\n".format(context_text[:6000]) + code
             result = self.python_repl.run(full_code)
             return f"Calculated Result: {result.strip()}"
         except Exception as e:
@@ -209,44 +252,119 @@ class RagEngine:
             return {"context_rel": round(max(0, ctx_rel), 2), "answer_rel": round(max(0, ans_rel), 2)}
         except:
             return {}
+    def _expand_and_reretrieve(self, original_query: str, initial_nodes: List[Any]) -> List[Any]:
+        """
+        Two-pass retrieval logic:
+        1. Analyze top results from Pass 1 to find aliases/synonyms.
+        2. If aliases found, perform Pass 2 search.
+        3. Merge and deduplicate results.
+        """
+        # If the first pass yielded no results, there's no point in expanding the search.
+        if not initial_nodes:
+            return []
 
+        # analyze the top 5 most relevant snippets to save time and tokens.
+        context_preview = "\n".join([n.get_content()[:400] for n in initial_nodes[:5]])
+        
+        prompt = (
+            "You are a Search Optimizer. Analyze the Context below based on the User Query.\n"
+            "Identify if the Context reveals specific ALTERNATIVE NAMES, ALIASES, or PRECISE TERMINOLOGY "
+            "for the main subject of the Query that were not in the query itself.\n"
+            "Example: Query='Snivellus', Context='James called Snape Snivellus'. -> Result: ['Severus Snape']\n"
+            "Example: Query='Harry', Context='Harry Potter flew'. -> Result: [] (Already in query/obvious)\n\n"
+            f"User Query: {original_query}\n"
+            f"Context Preview:\n{context_preview}\n\n"
+            "Return a JSON object: {\"found_new_terms\": true/false, \"terms\": [\"term1\", \"term2\"]}\n"
+            "If no distinct new search terms are found, return {\"found_new_terms\": false}."
+        )
+
+        try:
+            # Asking LLM
+            resp = self.llm.complete(prompt)
+            # Parse the JSON (using the existing `_extract_json` helper if available, or a simple try/catch block).
+            txt = resp.text.strip()
+            # Simple markdown cleaning
+            if "```json" in txt:
+                txt = txt.split("```json")[1].split("```")[0]
+            elif "```" in txt:
+                txt = txt.split("```")[1].split("```")[0]
+            
+            data = json.loads(txt)
+            
+            if not data.get("found_new_terms") or not data.get("terms"):
+                return initial_nodes
+
+            new_terms = data["terms"]
+            #Forming an extended request. (OR logic)
+            expanded_query_str = " ".join(new_terms)
+            
+            self.console.print(f"[dim yellow]🔄 Re-retrieval triggered. Found aliases: {new_terms}[/dim yellow]")
+            
+            # PASS 2: Search using new terms
+            additional_nodes = self._retrieve_docs(expanded_query_str)
+            
+            # MERGE & DEDUPLICATE
+            seen_ids = {n.node_id for n in initial_nodes}
+            merged_nodes = list(initial_nodes)
+            
+            for node in additional_nodes:
+                if node.node_id not in seen_ids:
+                    merged_nodes.append(node)
+                    seen_ids.add(node.node_id)
+            
+            return merged_nodes
+
+        except Exception as e:
+            # In case of a logic error in the extension, we simply return the original nodes.
+            # self.console.print(f"[dim red]Alias mining failed: {e}[/dim red]")
+            return initial_nodes
     def answer(self, question: str, doc_id: Optional[str] = None):
         t_start = time.time()
         
         # 1. Rewrite
         standalone_query = self._rewrite_query(question)
-        
+        self.console.print(f"1")
         # --- Session Summary Handler ---
         if standalone_query == "__META_SUMMARIZE_SESSION__":
             history_str = "\n".join([f"{m.role.value}: {m.content}" for m in self.memory.get()])
             self.console.print(Panel(history_str or "No history", title="Session Summary", border_style="blue"))
             return
 
-        # 2. Retrieve
-        allowed_nodes = self._retrieve_docs(standalone_query)
-        
+        # 2. Retrieve (Two-Pass Strategy)
+        # Pass 1: Direct search
+        initial_nodes = self._retrieve_docs(standalone_query)
+        self.console.print(f"2")
+        # Pass 2: Alias Mining & Re-retrieval (Smart Expansion)
+        # Sending the results of the first pass for analysis to find hidden connections.
+        allowed_nodes = self._expand_and_reretrieve(standalone_query, initial_nodes)
+        self.console.print(f"3")
         # 3. Prepare Context
         context_text = ""
         citations = []
         chunks_for_metrics = []
         display_idx = 0
+        self.console.print(f"[debug] allowed_nodes ({len(allowed_nodes)}):")
+        for i, n in enumerate(allowed_nodes):
+            self.console.print(f"{i}: {getattr(n, 'node_id', id(n))}, source_type={n.metadata.get('source_type')}, length={len(n.get_content())}")
 
-        for n in allowed_nodes[:20]:
+        for n in allowed_nodes[:30]:# for better information management
             meta = n.metadata
-            if meta.get("source_type") == "episodic_memory":
-                continue
+            #if meta.get("source_type") == "episodic_memory":
+                #continue
             
             display_idx += 1
             clean_content = " ".join(n.get_content().split())
             chunks_for_metrics.append(clean_content)
             
             # Formating context for LLM
-            src_label = f"Source [{display_idx}]"
+            short_excerpt = clean_content  # trim to reasonable length
+            context_text += f"=== SOURCE [{display_idx}] ===\n"
             if meta.get("source_type") == "table_markdown":
-                context_text += f"{src_label} (Table Rows {meta.get('row_idx')}): {clean_content}\n\n"
+                context_text += f"(table rows: {meta.get('row_idx')})\n"
             else:
-                context_text += f"{src_label} (Page {meta.get('page')}): {clean_content}\n\n"
-                
+                context_text += f"(page: {meta.get('page')})\n"
+            context_text += short_excerpt + "\n\n"
+
             # Formatting citations for User
             file_label = meta.get("doc_id", "Unknown")
             loc_text = f"Pg {meta.get('page')}" if "page" in meta else ""
@@ -272,12 +390,14 @@ class RagEngine:
             "1) If you used a SYSTEM CALCULATION RESULT, begin your answer with a one-line header: "
             "'Context used: SYSTEM CALCULATION'.\n"
             "2) If you used chat-history to clarify the question (follow-up), begin with a one-line header: "
-            "'Context used: conversation (short: <one-line summary>)'. Example: 'Context used: conversation (interpreted \"he\" as Severus Snape)'.\n"
+            "'Context used: conversation (short: <one-line summary>)'. Example: 'Context used: conversation (interpreted \"he\" as (full name)))'.\n"
             "3) Provide the answer concisely. If you quote factual content from context, add citations like [1], [2] "
             "matching the context blocks provided.\n"
             "4) If you must estimate, prefix the estimate with 'ESTIMATED:'.\n"
             "5) No hallucinations; if info is not in context, say 'No information in context about X.'\n"
-            "6) Keep overall answer under ~400 words when possible; include a 1–2 sentence summary at the top for long replies.\n\n"
+            "6) Keep overall answer under ~400 words when possible; include a 1–2 sentence summary at the top for long replies.\n"
+            "7)If the question refers to a known alias or alternative name for an entity,match it to mentions in CONTEXT.\n"
+            "8)Titles, names, and entities may be matched approximately(e.g. spelling variants, typographic quotes, abbreviations).\n\n"
             "Answer now using only CONTEXT and the QUESTION."
         )
 
@@ -344,7 +464,7 @@ class RagEngine:
             ref_table.add_column("Ref"); ref_table.add_column("Doc"); ref_table.add_column("Loc")
             
             seen = set()
-            for c in citations[:10]:
+            for c in citations[:40]:#More links to documents displayed to the user (More informative UI)
                 if c['id'] not in seen:
                     ref_table.add_row(f"[{c['id']}]", c['file'], f"{c['loc']}\n{c['snippet']}")
                     seen.add(c['id'])
