@@ -1,9 +1,10 @@
+#src/rag_engine.py
 import os
 import time
 import json
-import sys
 import io
 import contextlib
+import pandas as pd
 import numpy as np
 from pathlib import Path
 from typing import Optional, List, Any
@@ -23,13 +24,17 @@ from rich.table import Table
 from rich.panel import Panel
 from rich import box
 
-import subprocess
-import tempfile
 import ast
-import textwrap
+
 #Enhanced logic and protection for mathematics
 class SafePythonRunner:
-    def __init__(self, timeout: int = 5, max_output_chars: int = 2000):
+    """
+    Safe runner for short pandas snippets.
+    - Validates AST to block dangerous imports/calls.
+    - Executes code in a tiny sandbox providing only df, pd, np.
+    - Expects the final answer assigned to 'result'.
+    """
+    def __init__(self, timeout: int = 10, max_output_chars: int = 4000):
         self.timeout = timeout
         self.max_output_chars = max_output_chars
 
@@ -37,53 +42,48 @@ class SafePythonRunner:
         tree = ast.parse(src)
         banned_names = {"open","exec","eval","__import__","compile","os","sys","subprocess","socket"}
         for node in ast.walk(tree):
-            # forbid import of unsafe modules
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 for n in node.names:
                     if n.name and any(b in n.name for b in banned_names):
                         raise ValueError(f"Forbidden import: {n.name}")
-            # forbid calls to banned names
             if isinstance(node, ast.Call):
                 func = node.func
                 if isinstance(func, ast.Name) and func.id in banned_names:
                     raise ValueError(f"Forbidden function call: {func.id}")
         return True
 
-    def run(self, user_code: str) -> str:
-        # Minimal wrapper: provide context_str variable if referenced externally
-        wrapper = textwrap.dedent(f"""
-        import json
-        import pandas as pd
-        import numpy as np
-        import io
-        context_str = globals().get('context_str', '')
+    def run_pandas_code(self, df: pd.DataFrame, code: str) -> str:
+        # Validate AST first
         try:
-{self._indent_code(user_code, 12)}
+            self._validate_ast(code)
         except Exception as e:
-            print('<<EXC>>' + str(e))
-        """)
-        # Validate
-        self._validate_ast(wrapper)
-        # write to temp file and run in subprocess with timeout
-        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as f:
-            f.write(wrapper)
-            path = f.name
-        try:
-            proc = subprocess.run([sys.executable, path],
-                                  capture_output=True, text=True, timeout=self.timeout)
-            out = proc.stdout or proc.stderr or ""
-            return out[: self.max_output_chars]
-        except subprocess.TimeoutExpired:
-            return "ERROR: execution timeout"
-        finally:
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
+            return f"Code rejected by AST validator: {e}"
 
-    def _indent_code(self, code: str, spaces: int) -> str:
-        pad = " " * spaces
-        return "\n".join(pad + line if line.strip() else line for line in code.splitlines())
+        # Prepare isolated environment
+        buffer = io.StringIO()
+        local_scope = {"df": df, "pd": pd, "np": np, "result": None}
+
+        try:
+            with contextlib.redirect_stdout(buffer):
+                # Execute in restricted globals
+                exec(code, {"__builtins__": {}}, local_scope)
+        except Exception as e:
+            return f"Code Execution Error: {e}"
+
+        res = local_scope.get("result")
+        stdout_output = buffer.getvalue().strip()
+
+        if res is None:
+            if stdout_output:
+                return f"Output:\n{stdout_output}"
+            return "Code executed but 'result' variable was not assigned."
+
+        if isinstance(res, (pd.DataFrame, pd.Series)):
+            try:
+                return res.to_markdown()
+            except Exception:
+                return res.to_string()
+        return str(res)
 
 
 class RagEngine:
@@ -92,7 +92,6 @@ class RagEngine:
         self.role = role
         self.vs_client = VectorStoreClient()
         self.console = Console()
-        self.python_repl = SafePythonRunner(timeout=5)
         
         # --- Config LLM ---
         if not os.getenv("GOOGLE_API_KEY"):
@@ -131,6 +130,48 @@ class RagEngine:
             "chat_history": [{"role": m.role.value if hasattr(m.role, "value") else str(m.role) , "content": m.content} for m in msgs]
         }
         self.history_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        
+    def _resolve_table_path(self, node: Any) -> Optional[str]:
+        """
+        Robust resolution of parquet path for a structured_table node.
+        Tries metadata['table_path'], then metadata['file_path'], then manifest file,
+        then fallback to data/tables/{doc_id}.parquet.
+        """
+        meta = node.metadata or {}
+        candidates = []
+
+        # 1) explicit stored fields
+        if meta.get("table_path"):
+            candidates.append(Path(meta["table_path"]))
+        if meta.get("file_path"):
+            candidates.append(Path(meta["file_path"]))
+
+        # 2) manifest next to data/
+        doc_id = meta.get("doc_id")
+        if doc_id:
+            manifest = Path("data") / f"{doc_id}_manifest.json"
+            try:
+                if manifest.exists():
+                    m = json.loads(manifest.read_text(encoding="utf-8"))
+                    if m.get("table_path"):
+                        candidates.append(Path(m["table_path"]))
+            except Exception:
+                pass
+
+        # 3) default location
+        if doc_id:
+            candidates.append(Path("data") / "tables" / f"{doc_id}.parquet")
+
+        # Normalize and return first existing
+        for p in candidates:
+            try:
+                p_abs = p if p.is_absolute() else p.resolve()
+                if p_abs.exists():
+                    return str(p_abs)
+            except Exception:
+                # continue to next candidate
+                continue
+        return None
 
     def _rewrite_query(self, raw_query: str) -> str:
         """Uses LLM to contextualize the query based on history."""
@@ -186,54 +227,72 @@ class RagEngine:
         nodes = self._retrieve_docs(query)
         memories = [n.get_content() for n in nodes if n.metadata.get("source_type") == "episodic_memory"]
         return "\n".join(memories[:5]) if memories else ""
-
-    def _handle_math_operations(self, question: str, context_text: str) -> Optional[str]:
-        # 1) Math detection -> expect JSON
-        check_prompt = (
-            f"Question: '{question}'\n"
-            "Does answering this require mathematical calculation (sum, average, count, difference) "
-            "based on data present in the provided context? Answer in one line: YES or NO.\n"
-            "If YES, in the next line output a very short PLAN describing which operation(s) to perform "
-            "(e.g. 'PLAN: sum column A grouped by B').\n"
-            "No extra text.\n"
-            "REPLY EXACTLY WITH JSON: {\"is_math\": true/false, \"plan\":\"...\"}\n"
-             f"Question: {question}\nContext: {context_text[:2000]}"
-        )
-        #Checking the necessity of performing calculations
-
-        resp = self.llm.complete(check_prompt)
-        txt = resp.text.strip()
-        try:
-            parsed = json.loads(txt)
-        except:
-            # try to extract JSON substring or fallback to NO
+    
+    def _handle_math_operations(self, question: str, retrieved_nodes: List[Any]) -> Optional[str]:
+        # Find the first structured_table anywhere in retrieved nodes
+        table_nodes = [n for n in retrieved_nodes if n.metadata.get("source_type") == "structured_table"]
+        if not table_nodes:
             return None
-        if not parsed.get("is_math"):
-            return None
-        plan = parsed.get("plan","")
-        
-        # 2) Request code in JSON
-        self.console.print("[yellow] Math detected. Executing Code Interpreter...[/yellow]")
-        code_prompt = (
-            "You are a Python Data Analyst. RETURN A JSON OBJECT: {\"code\": \"<python code>\"}\n"
-            "Constraints: no network, no file writes; only use pandas, numpy, io. Print final answer only.\n"
-            f"context_str = '''{context_text[:6000]}'''\n"
-            f"Question: {question}\n"
-        )
 
-        
+        target_node = table_nodes[0]  # keep previous behaviour, but search earlier
+        file_path = self._resolve_table_path(target_node)
+
+        if not file_path:
+            self.console.print(f"[red]❌ Table file missing for doc '{target_node.metadata.get('doc_id')}'[/red]")
+            return None
+
+        self.console.print(f"[yellow]⚡ Detected Table Operation on: {Path(file_path).name}[/yellow]")
+
+        # Try to load parquet
         try:
-            resp = self.llm.complete(code_prompt)
-            txt = resp.text.strip()
-            code_json = json.loads(self._extract_json(txt))
-            code = code_json.get("code","")
-            # 3) Run code in sandbox
-            # prepend a safe header so context_str is available
-            full_code = "context_str = '''{}'''\n".format(context_text[:6000]) + code
-            result = self.python_repl.run(full_code)
-            return f"Calculated Result: {result.strip()}"
+            df = pd.read_parquet(file_path)
         except Exception as e:
-            return f"Calculation failed: {str(e)}"
+            self.console.print(f"[red]Failed to load parquet at {file_path}: {e}[/red]")
+            return None
+
+        # Defensive cleaning / type coercion for common columns
+        # Quantity: numeric, Price: float (handle comma decimal)
+        if "Quantity" in df.columns:
+            try:
+                df["Quantity"] = pd.to_numeric(df["Quantity"].astype(str).str.replace(",", "."), errors="coerce").fillna(0).astype(int)
+            except Exception:
+                pass
+
+        if "Price" in df.columns:
+            try:
+                df["Price"] = pd.to_numeric(df["Price"].astype(str).str.replace(",", "."), errors="coerce").fillna(0.0)
+            except Exception:
+                pass
+
+        # If the question is a simple aggregate, try to generate a JSON-plan fallback
+        # (This is a safe local handler avoiding LLM code execution when we can parse intent)
+
+        # Otherwise fallback to Text-to-Pandas via LLM (existing pipeline)
+        schema_info = target_node.get_content().split("SAMPLE DATA:")[0]
+        code_prompt = (
+            "You are a Python Data Analyst. Given a pandas DataFrame `df` already loaded.\n"
+            f"SCHEMA:\n{schema_info}\n\nQUESTION: {question}\n\n"
+            "Write Python code that assigns the final answer to a variable named `result`.\n"
+            "Rules:\n"
+            " - Use only `df` variable; do not load files.\n"
+            " - Use pd.to_numeric where needed (no external imports).\n"
+            " - If the question asks for 'top N', return a DataFrame stored in `result`.\n"
+            " - For counts over transactions, prefer `nunique()` on BillNo.\n"
+            " - Keep the code short and deterministic.\n\n"
+            "Return only Python code (no explanation)."
+        )
+
+        try:
+            resp_text = self.llm.complete(code_prompt).text
+            code = resp_text.replace("```python", "").replace("```", "").strip()
+            self.console.print(f"[dim]Generated Code (from LLM):\n{code}[/dim]")
+
+            runner = SafePythonRunner(timeout=15)
+            answer = runner.run_pandas_code(df, code)
+            return f"Calculated Result from Data: {answer}"
+        except Exception as e:
+            return f"Failed to execute math plan: {e}"
+
 
     def _calculate_metrics(self, question: str, answer: str, context_chunks: list) -> dict:
         # Simple similarity check for display purposes
@@ -318,12 +377,12 @@ class RagEngine:
             # In case of a logic error in the extension, we simply return the original nodes.
             # self.console.print(f"[dim red]Alias mining failed: {e}[/dim red]")
             return initial_nodes
+        
     def answer(self, question: str, doc_id: Optional[str] = None):
         t_start = time.time()
         
         # 1. Rewrite
         standalone_query = self._rewrite_query(question)
-        self.console.print(f"1")
         # --- Session Summary Handler ---
         if standalone_query == "__META_SUMMARIZE_SESSION__":
             history_str = "\n".join([f"{m.role.value}: {m.content}" for m in self.memory.get()])
@@ -333,19 +392,19 @@ class RagEngine:
         # 2. Retrieve (Two-Pass Strategy)
         # Pass 1: Direct search
         initial_nodes = self._retrieve_docs(standalone_query)
-        self.console.print(f"2")
         # Pass 2: Alias Mining & Re-retrieval (Smart Expansion)
         # Sending the results of the first pass for analysis to find hidden connections.
         allowed_nodes = self._expand_and_reretrieve(standalone_query, initial_nodes)
-        self.console.print(f"3")
+        if not allowed_nodes:
+            self.console.print("[red]No relevant data found or access denied.[/red]")
+            return
+        math_result = self._handle_math_operations(standalone_query, allowed_nodes)
         # 3. Prepare Context
         context_text = ""
         citations = []
         chunks_for_metrics = []
         display_idx = 0
-        self.console.print(f"[debug] allowed_nodes ({len(allowed_nodes)}):")
-        for i, n in enumerate(allowed_nodes):
-            self.console.print(f"{i}: {getattr(n, 'node_id', id(n))}, source_type={n.metadata.get('source_type')}, length={len(n.get_content())}")
+
 
         for n in allowed_nodes[:30]:# for better information management
             meta = n.metadata
@@ -379,9 +438,8 @@ class RagEngine:
             })
 
         # 4. Math
-        math_result = self._handle_math_operations(standalone_query, context_text)
         if math_result:
-            context_text += f"\n\n>>> SYSTEM CALCULATION RESULT:\n{math_result}\n<<<\n"
+            context_text += f"\n\n>>> SYSTEM CALCULATION RESULT (STRICT TRUTH):\n{math_result}\n<<<\n"
 
         # 5. Generate
         sys_msg = (
@@ -400,7 +458,6 @@ class RagEngine:
             "8)Titles, names, and entities may be matched approximately(e.g. spelling variants, typographic quotes, abbreviations).\n\n"
             "Answer now using only CONTEXT and the QUESTION."
         )
-
         
         context_block = (
             "<<<CONTEXT-BEGIN>>>\n"

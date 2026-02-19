@@ -1,6 +1,5 @@
 import os
-import shutil
-from typing import List, Optional
+from typing import List
 from llama_index.core import (
     VectorStoreIndex,
     StorageContext,
@@ -52,19 +51,24 @@ class VectorStoreClient:
 
     def upsert_document(self, doc_id: str, nodes: List[Document]):
         """
-        A safe upsert operation for FAISS.
+        A safe upsert operation.
         """
+        # 1. Attempt to delete existing nodes for this doc_id
+        # Note: Standard FaissVectorStore in LlamaIndex often fails here because it doesn't track ref_doc_id mapping on disk perfectly.
+        # We wrap it to prevent crashing.
         try:
-            # FAISS may not support deletion.. 
-
+            # Some versions of LlamaIndex/FAISS do not support this
             self.index.delete_ref_doc(doc_id, delete_from_docstore=True)
-        except NotImplementedError:
-            print(f"Warning: FAISS does not support deleting {doc_id}. The data will be added as new.")
-        
-        #  Inserting new nodes
+        except (NotImplementedError, ValueError):
+            # ignoring the deletion error; FAISS will simply add the new vectors.
+            pass
+        except Exception as e:
+            print(f"Warning during delete: {e}")
+
+        # 2. Insert new nodes
         self.index.insert_nodes(nodes)
         
-        # saving
+        # 3. Save
         self._save_index()
 
     def add_memory_trace(self, text: str, role: str):
